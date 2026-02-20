@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import pandas as pd
 import ccxt
 from ta.momentum import RSIIndicator
@@ -11,11 +12,12 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
-    ConversationHandler,
 )
 
 # ===== CONFIG =====
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # Replace!
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN environment variable is missing or empty!")
 
 PAIRS = [
     "BTC/USDT", "ETH/USDT", "THE/USDT", "PHA/USDT", "SOMI/USDT",
@@ -38,8 +40,23 @@ exchange = ccxt.bybit({
     'options': {'defaultType': 'spot'},
 })
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+# ===== GLOBAL ERROR HANDLER =====
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception while handling update:", exc_info=context.error)
+    if update and hasattr(update, 'effective_chat') and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⚠️ Erreur dans le bot : {context.error}\nVérifiez les logs."
+            )
+        except Exception:
+            pass
 
 # ===== DATA FETCH =====
 async def get_data(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
@@ -93,9 +110,9 @@ async def scan_pairs(context: ContextTypes.DEFAULT_TYPE):
     if not WATCHING:
         return
 
-    chat_id = context.job.data.get('chat_id')  # stored when starting
+    chat_id = context.job.data.get('chat_id')
     tf = CURRENT_TF
-    htf = "1h" if tf == "5m" else "4h"  # reasonable higher TF
+    htf = "1h" if tf == "5m" else "4h"
 
     for pair in PAIRS:
         try:
@@ -121,7 +138,7 @@ async def scan_pairs(context: ContextTypes.DEFAULT_TYPE):
                 )
                 await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
-            await asyncio.sleep(1.5)  # gentle rate limit
+            await asyncio.sleep(1.5)
 
         except Exception as e:
             logger.error(e)
@@ -139,8 +156,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "🚀 Scalping Signal Bot\n\n"
-        "Choose timeframe to start watching signals on the pair list.\n"
-        "Signals sent here when detected.",
+        "Choisissez le timeframe pour commencer la surveillance.\n"
+        "Les signaux seront envoyés ici.",
         reply_markup=reply_markup
     )
 
@@ -152,10 +169,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "start_5m":
         WATCHING = True
         CURRENT_TF = "5m"
-        await query.edit_message_text("Started watching **5m** timeframe.\nSignals will appear here.")
+        await query.edit_message_text("Surveillance **5m** démarrée.\nLes signaux apparaîtront ici.")
         context.job_queue.run_repeating(
             scan_pairs,
-            interval=300,           # 5 minutes
+            interval=300,
             first=10,
             data={'chat_id': query.message.chat_id},
             name="signal_scanner"
@@ -164,7 +181,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "start_15m":
         WATCHING = True
         CURRENT_TF = "15m"
-        await query.edit_message_text("Started watching **15m** timeframe.\nSignals will appear here.")
+        await query.edit_message_text("Surveillance **15m** démarrée.\nLes signaux apparaîtront ici.")
         context.job_queue.run_repeating(
             scan_pairs,
             interval=300,
@@ -175,34 +192,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "stop":
         WATCHING = False
-        # Optional: remove job if you want strict cleanup
-        # current_jobs = context.job_queue.get_jobs_by_name("signal_scanner")
-        # for job in current_jobs: job.schedule_removal()
-        await query.edit_message_text("🛑 Stopped watching. No more signals until restarted.")
+        await query.edit_message_text("🛑 Surveillance arrêtée.")
 
     elif query.data == "list":
         pairs_text = "\n".join(f"• {p}" for p in PAIRS)
-        await query.edit_message_text(f"**Watch List** ({len(PAIRS)} pairs):\n{pairs_text}")
+        await query.edit_message_text(f"**Liste des paires** ({len(PAIRS)}):\n{pairs_text}")
 
     elif query.data == "help":
         await query.edit_message_text(
-            "Help & Status:\n"
-            "• Start 5m / 15m → begin receiving signals\n"
-            "• Stop Watching → pause alerts\n"
-            "• Signals: EMA9/21 + RSI pullback + Volume spike + higher TF filter\n"
-            "• Data: Bybit public API\n"
-            "Use /start to open menu anytime."
+            "Aide :\n"
+            "• Start 5m / 15m → lance les signaux\n"
+            "• Stop Watching → arrête les alertes\n"
+            "• Signaux : EMA9/21 + RSI + Volume + filtre TF supérieur\n"
+            "• Données : Bybit public\n"
+            "/start pour ouvrir le menu."
         )
 
 # ===== MAIN =====
-def main():
+async def main_async():
+    # Small delay to let container network stabilize
+    await asyncio.sleep(8)
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_error_handler(error_handler)
 
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Optional extra commands
     async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state = "Active" if WATCHING else "Stopped"
         tf = CURRENT_TF if WATCHING else "-"
@@ -210,7 +227,21 @@ def main():
 
     app.add_handler(CommandHandler("status", status))
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(
+        allowed_updates=Update.ALL_TYPES,
+        bootstrap_retries=10,
+        drop_pending_updates=True,
+        poll_interval=0.5,
+        timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+    )
+
+    # Keep running
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_async())
