@@ -2,4 +2,4 @@ pandas
 requests
 ccxt
 ta
-python-telegram-bot>=20.0
+python-telegram-bot==21.5
