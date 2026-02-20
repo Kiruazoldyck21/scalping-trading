@@ -17,7 +17,7 @@ from telegram.ext import (
 # ===== CONFIG =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
-    raise ValueError("TELEGRAM_TOKEN environment variable is missing or empty!")
+    raise ValueError("La variable d'environnement TELEGRAM_TOKEN est manquante ou vide !")
 
 PAIRS = [
     "BTC/USDT", "ETH/USDT", "THE/USDT", "PHA/USDT", "SOMI/USDT",
@@ -53,7 +53,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         try:
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text=f"⚠️ Erreur dans le bot : {context.error}\nVérifiez les logs."
+                text=f"⚠️ Erreur dans le bot : {context.error}\nVérifiez les logs Railway."
             )
         except Exception:
             pass
@@ -166,6 +166,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     global WATCHING, CURRENT_TF
 
+    # Safety check – job_queue may be None during startup
+    if context.job_queue is None:
+        await query.edit_message_text(
+            "⚠️ Le bot n'est pas encore complètement prêt.\n"
+            "Attendez 10–20 secondes et réessayez le bouton."
+        )
+        logger.warning("job_queue était None – bouton pressé trop tôt")
+        return
+
     if query.data == "start_5m":
         WATCHING = True
         CURRENT_TF = "5m"
@@ -173,7 +182,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.job_queue.run_repeating(
             scan_pairs,
             interval=300,
-            first=10,
+            first=5,
             data={'chat_id': query.message.chat_id},
             name="signal_scanner"
         )
@@ -185,13 +194,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.job_queue.run_repeating(
             scan_pairs,
             interval=300,
-            first=10,
+            first=5,
             data={'chat_id': query.message.chat_id},
             name="signal_scanner"
         )
 
     elif query.data == "stop":
         WATCHING = False
+        # Clean up jobs
+        for job in context.job_queue.get_jobs_by_name("signal_scanner"):
+            job.schedule_removal()
         await query.edit_message_text("🛑 Surveillance arrêtée.")
 
     elif query.data == "list":
@@ -210,7 +222,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== MAIN =====
 async def main_async():
-    # Small delay to let container network stabilize
+    # Give Railway container time to stabilize network
     await asyncio.sleep(8)
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -220,6 +232,7 @@ async def main_async():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
 
+    # status command
     async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state = "Active" if WATCHING else "Stopped"
         tf = CURRENT_TF if WATCHING else "-"
@@ -229,6 +242,7 @@ async def main_async():
 
     await app.initialize()
     await app.start()
+
     await app.updater.start_polling(
         allowed_updates=Update.ALL_TYPES,
         bootstrap_retries=10,
@@ -239,6 +253,8 @@ async def main_async():
         write_timeout=30,
         connect_timeout=30,
     )
+
+    logger.info("Bot polling démarré avec succès – envoyez /start pour tester")
 
     # Keep running
     await asyncio.Event().wait()
