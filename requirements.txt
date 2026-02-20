@@ -1,4 +1,4 @@
-python-binance
 pandas
-ta
 requests
+ccxt
+ta
