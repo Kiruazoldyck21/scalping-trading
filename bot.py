@@ -77,7 +77,12 @@ while True:
                         f"TP: {tp:.4f}
 "
                         f"SL: {sl:.4f}"
-                    )
+                    msg = f"""📊 {pair} ({tf})
+Signal: {signal}
+Entry: {price:.4f}
+TP: {tp:.4f}
+SL: {sl:.4f}
+"""
                     send_telegram(msg)
 
         time.sleep(60)
