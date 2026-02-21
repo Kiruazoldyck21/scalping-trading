@@ -31,10 +31,6 @@ VOLUME_MULTIPLIER = 1.3
 TP_PERCENT = 0.005
 SL_PERCENT = 0.003
 
-# Global state (simple – for production use context.user_data or DB)
-WATCHING = False
-CURRENT_TF = "5m"          # default
-
 exchange = ccxt.bybit({
     'enableRateLimit': True,
     'options': {'defaultType': 'spot'},
@@ -105,13 +101,12 @@ async def check_signal(df_main: pd.DataFrame, df_htf: pd.DataFrame) -> tuple:
 
 # ===== BACKGROUND SIGNAL CHECKER =====
 async def scan_pairs(context: ContextTypes.DEFAULT_TYPE):
-    global WATCHING, CURRENT_TF
-
-    if not WATCHING:
+    # Utilisation de bot_data au lieu de variables globales
+    if not context.bot_data.get('watching', False):
         return
 
     chat_id = context.job.data.get('chat_id')
-    tf = CURRENT_TF
+    tf = context.bot_data.get('current_tf', "5m")
     htf = "1h" if tf == "5m" else "4h"
 
     for pair in PAIRS:
@@ -141,7 +136,7 @@ async def scan_pairs(context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(1.5)
 
         except Exception as e:
-            logger.error(e)
+            logger.error(f"Erreur scan {pair}: {e}")
 
 # ===== MENU HANDLERS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -164,47 +159,66 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    global WATCHING, CURRENT_TF
 
-    # Safety check – job_queue may be None during startup
+    # Vérification que job_queue est initialisé
     if context.job_queue is None:
         await query.edit_message_text(
-            "⚠️ Le bot n'est pas encore complètement prêt.\n"
-            "Attendez 10–20 secondes et réessayez le bouton."
+            "⚠️ Erreur de configuration : JobQueue non initialisé.\n"
+            "Le bot va redémarrer automatiquement dans quelques secondes..."
         )
-        logger.warning("job_queue était None – bouton pressé trop tôt")
+        logger.error("JobQueue est None - problème d'initialisation")
         return
 
     if query.data == "start_5m":
-        WATCHING = True
-        CURRENT_TF = "5m"
+        # Utilisation de bot_data au lieu de global
+        context.bot_data['watching'] = True
+        context.bot_data['current_tf'] = "5m"
+        
         await query.edit_message_text("Surveillance **5m** démarrée.\nLes signaux apparaîtront ici.")
-        context.job_queue.run_repeating(
-            scan_pairs,
-            interval=300,
-            first=5,
-            data={'chat_id': query.message.chat_id},
-            name="signal_scanner"
-        )
-
-    elif query.data == "start_15m":
-        WATCHING = True
-        CURRENT_TF = "15m"
-        await query.edit_message_text("Surveillance **15m** démarrée.\nLes signaux apparaîtront ici.")
-        context.job_queue.run_repeating(
-            scan_pairs,
-            interval=300,
-            first=5,
-            data={'chat_id': query.message.chat_id},
-            name="signal_scanner"
-        )
-
-    elif query.data == "stop":
-        WATCHING = False
-        # Clean up jobs
+        
+        # Supprimer les anciens jobs s'ils existent
         for job in context.job_queue.get_jobs_by_name("signal_scanner"):
             job.schedule_removal()
+        
+        # Créer le nouveau job
+        context.job_queue.run_repeating(
+            scan_pairs,
+            interval=300,  # 5 minutes
+            first=5,       # Premier scan après 5 secondes
+            data={'chat_id': query.message.chat_id},
+            name="signal_scanner"
+        )
+        logger.info("Scan 5m démarré")
+
+    elif query.data == "start_15m":
+        context.bot_data['watching'] = True
+        context.bot_data['current_tf'] = "15m"
+        
+        await query.edit_message_text("Surveillance **15m** démarrée.\nLes signaux apparaîtront ici.")
+        
+        # Supprimer les anciens jobs s'ils existent
+        for job in context.job_queue.get_jobs_by_name("signal_scanner"):
+            job.schedule_removal()
+        
+        # Créer le nouveau job
+        context.job_queue.run_repeating(
+            scan_pairs,
+            interval=300,  # 5 minutes
+            first=5,       # Premier scan après 5 secondes
+            data={'chat_id': query.message.chat_id},
+            name="signal_scanner"
+        )
+        logger.info("Scan 15m démarré")
+
+    elif query.data == "stop":
+        context.bot_data['watching'] = False
+        
+        # Supprimer tous les jobs de scan
+        for job in context.job_queue.get_jobs_by_name("signal_scanner"):
+            job.schedule_removal()
+        
         await query.edit_message_text("🛑 Surveillance arrêtée.")
+        logger.info("Scan arrêté")
 
     elif query.data == "list":
         pairs_text = "\n".join(f"• {p}" for p in PAIRS)
@@ -220,44 +234,87 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/start pour ouvrir le menu."
         )
 
+# ===== STATUS COMMAND =====
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    watching = context.bot_data.get('watching', False)
+    tf = context.bot_data.get('current_tf', '5m') if watching else '-'
+    
+    # Compter les jobs actifs
+    jobs = context.job_queue.get_jobs_by_name("signal_scanner") if context.job_queue else []
+    job_count = len(jobs)
+    
+    await update.message.reply_text(
+        f"📊 **Statut du Bot**\n\n"
+        f"Surveillance: **{'Active' if watching else 'Arrêtée'}**\n"
+        f"Timeframe: **{tf}**\n"
+        f"Jobs actifs: **{job_count}**\n"
+        f"Paires surveillées: **{len(PAIRS)}**"
+    )
+
 # ===== MAIN =====
 async def main_async():
     # Give Railway container time to stabilize network
     await asyncio.sleep(8)
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # IMPORTANT: Activer le JobQueue avec .job_queue()
+    app = Application.builder() \
+        .token(TELEGRAM_TOKEN) \
+        .job_queue() \  # LIGNE CRUCIALE - active le système de tâches planifiées
+        .build()
 
+    # Vérification que le job_queue est bien initialisé
+    if app.job_queue is None:
+        logger.error("ÉCHEC CRITIQUE: JobQueue non initialisé!")
+        return
+
+    logger.info("✅ JobQueue initialisé avec succès")
+
+    # Ajout des handlers
     app.add_error_handler(error_handler)
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
-
-    # status command
-    async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        state = "Active" if WATCHING else "Stopped"
-        tf = CURRENT_TF if WATCHING else "-"
-        await update.message.reply_text(f"Status: **{state}**\nTimeframe: **{tf}**")
-
     app.add_handler(CommandHandler("status", status))
 
+    # Initialisation des données du bot
+    app.bot_data['watching'] = False
+    app.bot_data['current_tf'] = "5m"
+
+    # Démarrage du bot
     await app.initialize()
     await app.start()
 
-    await app.updater.start_polling(
-        allowed_updates=Update.ALL_TYPES,
-        bootstrap_retries=10,
-        drop_pending_updates=True,
-        poll_interval=0.5,
-        timeout=30,
-        read_timeout=30,
-        write_timeout=30,
-        connect_timeout=30,
-    )
+    # Démarrage du polling avec gestion d'erreurs
+    try:
+        await app.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            bootstrap_retries=10,
+            drop_pending_updates=True,
+            poll_interval=0.5,
+            timeout=30,
+            read_timeout=30,
+            write_timeout=30,
+            connect_timeout=30,
+        )
+        logger.info("✅ Bot polling démarré avec succès – envoyez /start pour tester")
+    except Exception as e:
+        logger.error(f"Erreur lors du démarrage du polling: {e}")
+        return
 
-    logger.info("Bot polling démarré avec succès – envoyez /start pour tester")
-
-    # Keep running
-    await asyncio.Event().wait()
+    # Garder le bot en marche
+    try:
+        await asyncio.Event().wait()
+    except KeyboardInterrupt:
+        logger.info("Arrêt demandé par l'utilisateur")
+    finally:
+        # Nettoyage propre
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
 
 if __name__ == "__main__":
-    asyncio.run(main_async())
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        logger.info("Bot arrêté proprement")
+    except Exception as e:
+        logger.error(f"Erreur fatale: {e}")
