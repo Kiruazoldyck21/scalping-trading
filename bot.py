@@ -108,6 +108,7 @@ async def scan_pairs(chat_id, tf):
                 tp = price * (1 + TP_PERCENT) if signal == "BUY" else price * (1 - TP_PERCENT)
                 sl = price * (1 - SL_PERCENT) if signal == "BUY" else price * (1 + SL_PERCENT)
 
+                # ─── FIXED: single f-string ────────────────────────────────
                 msg = (
                     f"📊 **{pair}** ({tf})\n"
                     f"Signal: **{signal}**\n"
@@ -115,7 +116,8 @@ async def scan_pairs(chat_id, tf):
                     f"TP: `{tp:.4f}`\n"
                     f"SL: `{sl:.4f}`"
                 )
-                # Ici il faudra passer le bot en paramètre
+                # ───────────────────────────────────────────────────────────
+
                 logger.info(f"SIGNAL: {pair} - {signal}")
 
             await asyncio.sleep(1)
@@ -154,6 +156,7 @@ async def scanning_loop(app):
                             tp = price * (1 + TP_PERCENT) if signal == "BUY" else price * (1 - TP_PERCENT)
                             sl = price * (1 - SL_PERCENT) if signal == "BUY" else price * (1 + SL_PERCENT)
 
+                            # ─── FIXED: single f-string ────────────────────────────────
                             msg = (
                                 f"📊 **{pair}** ({current_tf})\n"
                                 f"Signal: **{signal}**\n"
@@ -161,6 +164,7 @@ async def scanning_loop(app):
                                 f"TP: `{tp:.4f}`\n"
                                 f"SL: `{sl:.4f}`"
                             )
+                            # ───────────────────────────────────────────────────────────
                             
                             # Envoyer le message
                             if app.bot_data.get('chat_id'):
@@ -254,28 +258,22 @@ async def main():
     
     logger.info("🚀 Démarrage du bot...")
 
-    # Construction simple
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(CommandHandler("status", status))
 
-    # Init bot_data
     app.bot_data['chat_id'] = None
 
-    # Démarrage
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
 
     logger.info("✅ Bot démarré!")
 
-    # Démarrer la boucle de scan en arrière-plan
     asyncio.create_task(scanning_loop(app))
 
-    # Garder en vie
     try:
         while True:
             await asyncio.sleep(1)
