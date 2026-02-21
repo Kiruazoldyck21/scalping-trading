@@ -41,6 +41,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ===== VARIABLES GLOBALES (solution simple) =====
+watching = False
+current_tf = "5m"
+scan_task = None
+
 # ===== DATA FETCH =====
 async def get_data(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
     try:
@@ -79,17 +84,17 @@ async def check_signal(df_main: pd.DataFrame, df_htf: pd.DataFrame) -> tuple:
     return None, None
 
 # ===== SCAN FUNCTION =====
-async def scan_pairs(context: ContextTypes.DEFAULT_TYPE):
-    if not context.bot_data.get('watching', False):
-        return
-
-    chat_id = context.bot_data.get('chat_id')
-    tf = context.bot_data.get('current_tf', "5m")
+async def scan_pairs(chat_id, tf):
+    """Version simplifiée sans context"""
+    global watching
+    
     htf = "1h" if tf == "5m" else "4h"
-
     logger.info(f"Scan en cours - TF: {tf}")
 
     for pair in PAIRS:
+        if not watching:  # Vérifier si on doit continuer
+            return
+            
         try:
             df_main = await get_data(pair, tf, 200)
             df_htf = await get_data(pair, htf, 100)
@@ -110,12 +115,75 @@ async def scan_pairs(context: ContextTypes.DEFAULT_TYPE):
                     f"TP: `{tp:.4f}`\n"
                     f"SL: `{sl:.4f}`"
                 )
-                await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+                # Ici il faudra passer le bot en paramètre
+                logger.info(f"SIGNAL: {pair} - {signal}")
 
             await asyncio.sleep(1)
 
         except Exception as e:
             logger.error(f"Erreur {pair}: {e}")
+
+# ===== BOUCLE PRINCIPALE =====
+async def scanning_loop(app):
+    """Boucle qui tourne en arrière-plan"""
+    global watching, current_tf
+    
+    logger.info("🔄 Boucle de scan démarrée")
+    
+    while True:
+        try:
+            if watching:
+                logger.info(f"Scan actif - TF: {current_tf}")
+                
+                htf = "1h" if current_tf == "5m" else "4h"
+                
+                for pair in PAIRS:
+                    if not watching:
+                        break
+                        
+                    try:
+                        df_main = await get_data(pair, current_tf, 200)
+                        df_htf = await get_data(pair, htf, 100)
+
+                        if df_main.empty or df_htf.empty:
+                            continue
+
+                        signal, price = await check_signal(df_main, df_htf)
+
+                        if signal:
+                            tp = price * (1 + TP_PERCENT) if signal == "BUY" else price * (1 - TP_PERCENT)
+                            sl = price * (1 - SL_PERCENT) if signal == "BUY" else price * (1 + SL_PERCENT)
+
+                            msg = (
+                                f"📊 **{pair}** ({current_tf})\n"
+                                f"Signal: **{signal}**\n"
+                                f"Prix: `{price:.4f}`\n"
+                                f"TP: `{tp:.4f}`\n"
+                                f"SL: `{sl:.4f}`"
+                            )
+                            
+                            # Envoyer le message
+                            if app.bot_data.get('chat_id'):
+                                await app.bot.send_message(
+                                    chat_id=app.bot_data['chat_id'],
+                                    text=msg,
+                                    parse_mode="Markdown"
+                                )
+
+                        await asyncio.sleep(1)
+
+                    except Exception as e:
+                        logger.error(f"Erreur {pair}: {e}")
+            
+            # Attendre 60 secondes avant le prochain scan complet
+            for _ in range(60):
+                if not watching:
+                    break
+                await asyncio.sleep(1)
+                
+        except Exception as e:
+            logger.error(f"Erreur dans boucle principale: {e}")
+            await asyncio.sleep(10)
 
 # ===== HANDLERS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -133,29 +201,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global watching, current_tf
+    
     query = update.callback_query
     await query.answer()
 
-    # SOLUTION: Stocker le chat_id dans bot_data
+    # Sauvegarder le chat_id
     context.bot_data['chat_id'] = query.message.chat_id
 
     if query.data == "start_5m":
-        context.bot_data['watching'] = True
-        context.bot_data['current_tf'] = "5m"
-        await query.edit_message_text("✅ Surveillance 5m activée!")
-
-        # Version SIMPLIFIEE - pas de job_queue ici
-        if context.job_queue:
-            logger.info("JobQueue disponible - mais on utilise une méthode plus simple")
+        watching = True
+        current_tf = "5m"
+        await query.edit_message_text("✅ Surveillance **5m** activée!\nLes signaux apparaîtront ici.")
+        logger.info("Surveillance 5m activée")
 
     elif query.data == "start_15m":
-        context.bot_data['watching'] = True
-        context.bot_data['current_tf'] = "15m"
-        await query.edit_message_text("✅ Surveillance 15m activée!")
+        watching = True
+        current_tf = "15m"
+        await query.edit_message_text("✅ Surveillance **15m** activée!\nLes signaux apparaîtront ici.")
+        logger.info("Surveillance 15m activée")
 
     elif query.data == "stop":
-        context.bot_data['watching'] = False
+        watching = False
         await query.edit_message_text("🛑 Surveillance arrêtée")
+        logger.info("Surveillance arrêtée")
 
     elif query.data == "list":
         pairs_text = "\n".join(f"• {p}" for p in PAIRS[:10])
@@ -166,49 +235,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "**Aide**\n"
             "• Start: Active la surveillance\n"
             "• Stop: Désactive\n"
-            "• Signaux basés sur EMA/RSI/Volume"
+            "• Signaux basés sur EMA/RSI/Volume\n"
+            "• Scan toutes les 60 secondes"
         )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    watching = context.bot_data.get('watching', False)
-    tf = context.bot_data.get('current_tf', '5m')
+    global watching, current_tf
     await update.message.reply_text(
         f"📊 **Statut**\n"
-        f"Actif: {'Oui' if watching else 'Non'}\n"
-        f"Timeframe: {tf}"
+        f"Actif: {'✅ Oui' if watching else '❌ Non'}\n"
+        f"Timeframe: {current_tf}\n"
+        f"Paires: {len(PAIRS)}"
     )
-
-# ===== BOUCLE MANUELLE (solution de contournement) =====
-async def manual_scan_loop(app):
-    """Boucle manuelle qui remplace job_queue"""
-    logger.info("🔄 Démarrage de la boucle manuelle")
-    while True:
-        try:
-            if app.bot_data.get('watching', False):
-                logger.info("Scan manuel en cours...")
-                # Créer un faux context
-                class FakeContext:
-                    def __init__(self, bot, bot_data):
-                        self.bot = bot
-                        self.bot_data = bot_data
-                        self.job = type('Job', (), {'data': {'chat_id': bot_data.get('chat_id')}})()
-
-                fake_context = FakeContext(app.bot, app.bot_data)
-                await scan_pairs(fake_context)
-            await asyncio.sleep(60)  # Scan toutes les 60 secondes
-        except Exception as e:
-            logger.error(f"Erreur dans boucle manuelle: {e}")
-            await asyncio.sleep(10)
 
 # ===== MAIN =====
 async def main():
+    global scan_task
+    
     logger.info("🚀 Démarrage du bot...")
 
-    # Version TRES SIMPLE - pas de job_queue
+    # Construction simple
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Vérification
-    logger.info(f"JobQueue présent: {app.job_queue is not None}")
 
     # Handlers
     app.add_handler(CommandHandler("start", start))
@@ -216,8 +263,6 @@ async def main():
     app.add_handler(CommandHandler("status", status))
 
     # Init bot_data
-    app.bot_data['watching'] = False
-    app.bot_data['current_tf'] = "5m"
     app.bot_data['chat_id'] = None
 
     # Démarrage
@@ -227,8 +272,8 @@ async def main():
 
     logger.info("✅ Bot démarré!")
 
-    # SOLUTION DE CONTOURNEMENT: Boucle manuelle
-    asyncio.create_task(manual_scan_loop(app))
+    # Démarrer la boucle de scan en arrière-plan
+    asyncio.create_task(scanning_loop(app))
 
     # Garder en vie
     try:
