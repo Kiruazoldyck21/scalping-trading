@@ -2,10 +2,12 @@ import ccxt
 import pandas as pd
 import requests
 import time
+import os
+import traceback
 
 # ================= CONFIG =================
-TELEGRAM_BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "TELEGRAM_CHAT_ID"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
 CAPITAL = 1000
 RISK_PERCENT = 0.8
@@ -16,7 +18,8 @@ TIMEFRAMES = {
     "entry": "1m"
 }
 
-SLEEP_BETWEEN_PAIRS = 1.5
+# Much longer sleep → prevent ban (start conservative!)
+SLEEP_BETWEEN_PAIRS = 12          # seconds — 5 pairs/min → \~safe
 
 # ================= EXCHANGE =================
 exchange = ccxt.binance({
@@ -26,64 +29,89 @@ exchange = ccxt.binance({
 
 # ================= TELEGRAM =================
 def send_telegram(message):
-    url = "https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_BOT_TOKEN)
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram not configured")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
+        "text": message,
+        "parse_mode": "Markdown"
     }
     try:
-        requests.post(url, data=payload, timeout=10)
-    except Exception:
-        pass
+        r = requests.post(url, data=payload, timeout=12)
+        if r.status_code != 200:
+            print(f"Telegram failed: {r.text}")
+    except Exception as e:
+        print(f"Telegram error: {e}")
 
 # ================= MARKETS =================
-def load_all_usdt_pairs():
+def load_usdt_pairs(max_pairs=60):   # ← limit to avoid death by API calls
     markets = exchange.load_markets()
     pairs = []
-
     for symbol in markets:
-        data = markets[symbol]
-        if symbol.endswith("/USDT") and data.get("active"):
-            if "BUSD" not in symbol and "USDC" not in symbol:
-                pairs.append(symbol)
+        if (
+            symbol.endswith("/USDT")
+            and markets[symbol].get("active")
+            and "BUSD" not in symbol
+            and "USDC" not in symbol
+        ):
+            pairs.append(symbol)
+    # Optional: sort by volume (requires extra call — or hardcode top ones)
+    return pairs[:max_pairs]   # start small — increase later if stable
 
-    return pairs
-
-SYMBOLS = load_all_usdt_pairs()
+SYMBOLS = load_usdt_pairs()
 
 # ================= DATA =================
-def fetch_df(symbol, timeframe, limit=200):
-    data = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-    return pd.DataFrame(data, columns=["t", "o", "h", "l", "c", "v"])
+def fetch_df(symbol, timeframe, limit=300):
+    try:
+        data = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        df = pd.DataFrame(data, columns=["t", "o", "h", "l", "c", "v"])
+        df["t"] = pd.to_datetime(df["t"], unit="ms")
+        return df
+    except Exception as e:
+        print(f"fetch failed {symbol} {timeframe}: {e}")
+        return None
 
 # ================= INDICATORS =================
 def liquidity_sweep(df):
-    prev = df.iloc[-3]
-    last = df.iloc[-2]
-
-    if last["h"] > prev["h"] and last["c"] < prev["h"]:
+    if df is None or len(df) < 5:
+        return None
+    recent_high = df['h'].iloc[-6:-1].max()   # lookback improved
+    recent_low  = df['l'].iloc[-6:-1].min()
+    last = df.iloc[-1]
+    if last['h'] > recent_high and last['c'] < recent_high * 0.999:
         return "SELL"
-    if last["l"] < prev["l"] and last["c"] > prev["l"]:
+    if last['l'] < recent_low and last['c'] > recent_low * 1.001:
         return "BUY"
     return None
 
 def fibonacci_zone(high, low, price):
+    if high <= low:
+        return False
     for f in [0.618, 0.705, 0.786]:
         level = high - (high - low) * f
-        if abs(price - level) / price < 0.002:
+        if abs(price - level) / price < 0.005:   # widened to 0.5%
             return True
     return False
 
 def volume_ok(df):
-    avg = df["v"].rolling(20).mean().iloc[-2]
-    return df["v"].iloc[-2] > avg
+    if df is None or len(df) < 25:
+        return False
+    avg = df["v"].rolling(20).mean().iloc[-1]
+    return df["v"].iloc[-1] > avg * 1.3   # stricter
 
 # ================= CORE =================
 def analyze(symbol):
     try:
         df15 = fetch_df(symbol, TIMEFRAMES["bias"])
+        if df15 is None: return
+
         df5 = fetch_df(symbol, TIMEFRAMES["setup"])
-        df1 = fetch_df(symbol, TIMEFRAMES["entry"])
+        if df5 is None: return
+
+        df1 = fetch_df(symbol, TIMEFRAMES["entry"], limit=150)
+        if df1 is None: return
 
         sweep = liquidity_sweep(df5)
         if sweep is None:
@@ -110,38 +138,48 @@ def analyze(symbol):
             tp1 = price + (price - sl) * 1.5
             tp2 = price + (price - sl) * 2.5
 
-        msg = (
-            "SCALPING ALERT\n\n"
-            "PAIR: {}\n"
-            "BIAS 15M: {}\n"
-            "DIRECTION: {}\n\n"
-            "ENTRY: {:.6f}\n"
-            "SL: {:.6f}\n"
-            "TP1: {:.6f}\n"
-            "TP2: {:.6f}\n\n"
-            "CAPITAL: {} USDT\n"
-            "RISK: {}%"
-        ).format(
-            symbol,
-            bias,
-            sweep,
-            price,
-            sl,
-            tp1,
-            tp2,
-            CAPITAL,
-            RISK_PERCENT
-        )
+        msg = f"""**SCALPING ALERT**
+
+**PAIR:** {symbol}
+**BIAS 15M:** {bias}
+**DIRECTION:** {sweep}
+
+**ENTRY:** {price:.6f}
+**SL:**     {sl:.6f}
+**TP1:**    {tp1:.6f}
+**TP2:**    {tp2:.6f}
+
+**CAPITAL:** {CAPITAL} USDT
+**RISK:**    {RISK_PERCENT}%"""
 
         send_telegram(msg)
+        print(f"Alert sent → {symbol} {sweep}")
 
     except Exception as e:
-        send_telegram("ERROR on {} : {}".format(symbol, str(e)))
+        err = traceback.format_exc()
+        print(f"ERROR {symbol}: {e}\n{err}")
+        send_telegram(f"ERROR on {symbol}: {str(e)[:200]}")
 
-# ================= LOOP =================
-send_telegram("BOT STARTED - BINANCE SPOT - ALL USDT PAIRS")
+# ================= START =================
+if __name__ == "__main__":
+    print(f"BOT STARTED - Binance Spot - {len(SYMBOLS)} pairs")
+    send_telegram(f"Bot started on Railway — scanning {len(SYMBOLS)} pairs")
 
-while True:
-    for s in SYMBOLS:
-        analyze(s)
-        time.sleep(SLEEP_BETWEEN_PAIRS)
+    while True:
+        try:
+            for s in SYMBOLS:
+                analyze(s)
+                time.sleep(SLEEP_BETWEEN_PAIRS)
+            
+            # Optional: reload symbols every 4 hours (new listings)
+            time.sleep(60 * 60 * 4)
+            global SYMBOLS
+            SYMBOLS = load_usdt_pairs()
+            print(f"Reloaded symbols — now {len(SYMBOLS)} pairs")
+
+        except KeyboardInterrupt:
+            print("Stopped by user")
+            break
+        except Exception as e:
+            print(f"Main loop crash: {e}")
+            time.sleep(300)   # wait 5 min before retry
