@@ -1,16 +1,14 @@
 import ccxt
 import pandas as pd
-import numpy as np
 import requests
 import time
-import traceback
 
 # ===================== CONFIG =====================
 TELEGRAM_BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
 TELEGRAM_CHAT_ID = "TELEGRAM_CHAT_ID"
 
 CAPITAL = 1000
-RISK_PERCENT = 0.008  # 0.8%
+RISK_PERCENT = 0.8  # %
 
 TIMEFRAMES = {
     "bias": "15m",
@@ -18,7 +16,7 @@ TIMEFRAMES = {
     "entry": "1m"
 }
 
-SLEEP_BETWEEN_PAIRS = 1.2  # anti rate-limit
+SLEEP_BETWEEN_PAIRS = 1.2
 
 # ===================== EXCHANGE =====================
 exchange = ccxt.binance({
@@ -27,9 +25,9 @@ exchange = ccxt.binance({
 })
 
 # ===================== TELEGRAM =====================
-def send_telegram(message: str):
+def send_telegram(message):
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        url = "https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_BOT_TOKEN)
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message
@@ -43,14 +41,11 @@ def load_all_usdt_pairs():
     markets = exchange.load_markets()
     pairs = []
 
-    for symbol, data in markets.items():
-        if (
-            symbol.endswith("/USDT")
-            and data.get("active", False)
-            and "BUSD" not in symbol
-            and "USDC" not in symbol
-        ):
-            pairs.append(symbol)
+    for symbol in markets:
+        data = markets[symbol]
+        if symbol.endswith("/USDT") and data.get("active"):
+            if "BUSD" not in symbol and "USDC" not in symbol:
+                pairs.append(symbol)
 
     return pairs
 
@@ -92,10 +87,10 @@ def fibonacci_zone(high, low, price):
     return False
 
 def volume_confirmation(df):
-    avg_vol = df["volume"].rolling(20).mean().iloc[-2]
-    return df["volume"].iloc[-2] > avg_vol
+    avg = df["volume"].rolling(20).mean().iloc[-2]
+    return df["volume"].iloc[-2] > avg
 
-# ===================== CORE ANALYSIS =====================
+# ===================== CORE =====================
 def analyze_symbol(symbol):
     try:
         df15 = fetch_df(symbol, TIMEFRAMES["bias"])
@@ -124,33 +119,43 @@ def analyze_symbol(symbol):
             sl = price * 1.004
             tp1 = price - (sl - price) * 1.5
             tp2 = price - (sl - price) * 2.5
-            side_icon = "🔴 SELL"
+            side = "🔴 SELL"
         else:
             sl = price * 0.996
             tp1 = price + (price - sl) * 1.5
             tp2 = price + (price - sl) * 2.5
-            side_icon = "🟢 BUY"
+            side = "🟢 BUY"
 
         message = (
-            f"{side_icon} SCALPING ALERT\n\n"
-            f"Pair: {symbol}\n"
-            f"Bias 15m: {bias}\n\n"
-            f"✔ Liquidity Sweep (5m)\n"
-            f"✔ Anchored VWAP\n"
-            f"✔ Fibonacci Zone\n"
-            f"✔ Volume Confirmed\n\n"
-            f"Entry: {price:.6f}\n"
-            f"SL: {sl:.6f}\n"
-            f"TP1: {tp1:.6f}\n"
-            f"TP2: {tp2:.6f}\n\n"
-            f"Capital: {CAPITAL} USDT\n"
-            f"Risk: {RISK_PERCENT * 100:.2f}%"
+            "{} SCALPING ALERT\n\n"
+            "Pair: {}\n"
+            "Bias 15m: {}\n\n"
+            "✔ Liquidity Sweep (5m)\n"
+            "✔ Anchored VWAP\n"
+            "✔ Fibonacci Zone\n"
+            "✔ Volume Confirmed\n\n"
+            "Entry: {:.6f}\n"
+            "SL: {:.6f}\n"
+            "TP1: {:.6f}\n"
+            "TP2: {:.6f}\n\n"
+            "Capital: {} USDT\n"
+            "Risk: {}%"
+        ).format(
+            side,
+            symbol,
+            bias,
+            price,
+            sl,
+            tp1,
+            tp2,
+            CAPITAL,
+            RISK_PERCENT
         )
 
         send_telegram(message)
 
     except Exception as e:
-        send_telegram(f"⚠️ Error on {symbol}\n{str(e)}")
+        send_telegram("⚠️ Error on {}\n{}".format(symbol, str(e)))
 
 # ===================== MAIN LOOP =====================
 send_telegram("✅ Scalping bot STARTED (Railway • Binance Spot • All USDT pairs)")
