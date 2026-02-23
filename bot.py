@@ -1,287 +1,133 @@
-import asyncio
-import logging
-import os
-import pandas as pd
 import ccxt
-from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator
+import pandas as pd
+import numpy as np
+import requests
+import time
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-)
+# ================= CONFIG =================
+API_TOKEN = "TELEGRAM_BOT_TOKEN"
+CHAT_ID = "TELEGRAM_CHAT_ID"
 
-# ===== CONFIG =====
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-if not TELEGRAM_TOKEN:
-    raise ValueError("Token manquant !")
+CAPITAL = 1000
+RISK_PERCENT = 0.008
 
-PAIRS = [
-    "BTC/USDT", "ETH/USDT", "THE/USDT", "PHA/USDT", "SOMI/USDT",
-    "ARPA/USDT", "PYTH/USDT", "TIA/USDT", "ALPINE/USDT", "REI/USDT",
-    "RIF/USDT", "SUI/USDT", "PORTAL/USDT", "PARTI/USDT", "XLM/USDT"
-]
+TIMEFRAMES = {
+    "bias": "15m",
+    "setup": "5m",
+    "entry": "1m"
+}
 
-VOLUME_MA_PERIOD = 20
-VOLUME_MULTIPLIER = 1.3
-TP_PERCENT = 0.005
-SL_PERCENT = 0.003
-
-exchange = ccxt.bybit({
+exchange = ccxt.binance({
     'enableRateLimit': True,
-    'options': {'defaultType': 'spot'},
+    'options': {'defaultType': 'spot'}
 })
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# ================= TELEGRAM =================
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{API_TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
-# ===== VARIABLES GLOBALES (solution simple) =====
-watching = False
-current_tf = "5m"
-scan_task = None
+# ================= MARKETS =================
+def get_all_usdt_pairs():
+    markets = exchange.load_markets()
+    pairs = []
+    for s, m in markets.items():
+        if s.endswith("/USDT") and m['active']:
+            if "BUSD" not in s and "USDC" not in s:
+                pairs.append(s)
+    return pairs
 
-# ===== DATA FETCH =====
-async def get_data(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+SYMBOLS = get_all_usdt_pairs()
+
+# ================= DATA =================
+def get_df(symbol, tf, limit=200):
+    data = exchange.fetch_ohlcv(symbol, tf, limit=limit)
+    return pd.DataFrame(data, columns=['t','o','h','l','c','v'])
+
+# ================= INDICATORS =================
+def liquidity_sweep(df):
+    prev = df.iloc[-3]
+    last = df.iloc[-2]
+
+    if last['h'] > prev['h'] and last['c'] < prev['h']:
+        return "SELL"
+    if last['l'] < prev['l'] and last['c'] > prev['l']:
+        return "BUY"
+    return None
+
+def anchored_vwap(df, idx):
+    tp = (df['h'] + df['l'] + df['c']) / 3
+    vol = df['v']
+    return (tp[idx:] * vol[idx:]).cumsum().iloc[-1] / vol[idx:].cumsum().iloc[-1]
+
+def fibonacci_zone(high, low, price):
+    for f in [0.618, 0.705, 0.786]:
+        lvl = high - (high - low) * f
+        if abs(price - lvl) / price < 0.002:
+            return True
+    return False
+
+def volume_ok(df):
+    return df['v'].iloc[-2] > df['v'].rolling(20).mean().iloc[-2]
+
+# ================= CORE =================
+def analyze(symbol):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=interval, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-        df['close'] = df['close'].astype(float)
-        df['volume'] = df['volume'].astype(float)
-        return df
-    except Exception as e:
-        logger.error(f"Fetch error {symbol}: {e}")
-        return pd.DataFrame()
+        df15 = get_df(symbol, TIMEFRAMES['bias'])
+        df5  = get_df(symbol, TIMEFRAMES['setup'])
+        df1  = get_df(symbol, TIMEFRAMES['entry'])
 
-# ===== SIGNAL CHECK =====
-async def check_signal(df_main: pd.DataFrame, df_htf: pd.DataFrame) -> tuple:
-    if len(df_main) < 50 or len(df_htf) < 50:
-        return None, None
-
-    rsi = RSIIndicator(df_main['close'], 14).rsi()
-    ema9 = EMAIndicator(df_main['close'], 9).ema_indicator()
-    ema21 = EMAIndicator(df_main['close'], 21).ema_indicator()
-
-    ema9_htf = EMAIndicator(df_htf['close'], 9).ema_indicator().iloc[-1]
-    ema21_htf = EMAIndicator(df_htf['close'], 21).ema_indicator().iloc[-1]
-    htf_bullish = ema9_htf > ema21_htf
-    htf_bearish = ema9_htf < ema21_htf
-
-    price = df_main['close'].iloc[-1]
-    vol = df_main['volume'].iloc[-1]
-    vol_ma = df_main['volume'].rolling(window=VOLUME_MA_PERIOD).mean().iloc[-1]
-    high_vol = vol > (vol_ma * VOLUME_MULTIPLIER) if pd.notna(vol_ma) else False
-
-    if (ema9.iloc[-1] > ema21.iloc[-1] and 30 < rsi.iloc[-1] < 45 and high_vol and htf_bullish):
-        return "BUY", price
-    elif (ema9.iloc[-1] < ema21.iloc[-1] and 55 < rsi.iloc[-1] < 70 and high_vol and htf_bearish):
-        return "SELL", price
-    return None, None
-
-# ===== SCAN FUNCTION =====
-async def scan_pairs(chat_id, tf):
-    """Version simplifiée sans context"""
-    global watching
-    
-    htf = "1h" if tf == "5m" else "4h"
-    logger.info(f"Scan en cours - TF: {tf}")
-
-    for pair in PAIRS:
-        if not watching:  # Vérifier si on doit continuer
+        sweep = liquidity_sweep(df5)
+        if not sweep:
             return
-            
-        try:
-            df_main = await get_data(pair, tf, 200)
-            df_htf = await get_data(pair, htf, 100)
 
-            if df_main.empty or df_htf.empty:
-                continue
+        bias = "BULLISH" if df15['c'].iloc[-1] > df15['o'].iloc[-1] else "BEARISH"
+        price = df1['c'].iloc[-1]
 
-            signal, price = await check_signal(df_main, df_htf)
+        if not volume_ok(df1):
+            return
 
-            if signal:
-                tp = price * (1 + TP_PERCENT) if signal == "BUY" else price * (1 - TP_PERCENT)
-                sl = price * (1 - SL_PERCENT) if signal == "BUY" else price * (1 + SL_PERCENT)
+        high = df5['h'].max()
+        low = df5['l'].min()
 
-                # ─── FIXED: single f-string ────────────────────────────────
-                msg = (
-                    f"📊 **{pair}** ({tf})\n"
-                    f"Signal: **{signal}**\n"
-                    f"Prix: `{price:.4f}`\n"
-                    f"TP: `{tp:.4f}`\n"
-                    f"SL: `{sl:.4f}`"
-                )
-                # ───────────────────────────────────────────────────────────
+        if not fibonacci_zone(high, low, price):
+            return
 
-                logger.info(f"SIGNAL: {pair} - {signal}")
+        vwap = anchored_vwap(df5, -3)
 
-            await asyncio.sleep(1)
+        sl = price * (1.004 if sweep == "SELL" else 0.996)
+        risk = abs(price - sl)
+        tp1 = price - risk * 1.5 if sweep == "SELL" else price + risk * 1.5
+        tp2 = price - risk * 2.5 if sweep == "SELL" else price + risk * 2.5
 
-        except Exception as e:
-            logger.error(f"Erreur {pair}: {e}")
+        msg = f"""
+{'🔴 SELL' if sweep=='SELL' else '🟢 BUY'} SCALPING ALERT
 
-# ===== BOUCLE PRINCIPALE =====
-async def scanning_loop(app):
-    """Boucle qui tourne en arrière-plan"""
-    global watching, current_tf
-    
-    logger.info("🔄 Boucle de scan démarrée")
-    
-    while True:
-        try:
-            if watching:
-                logger.info(f"Scan actif - TF: {current_tf}")
-                
-                htf = "1h" if current_tf == "5m" else "4h"
-                
-                for pair in PAIRS:
-                    if not watching:
-                        break
-                        
-                    try:
-                        df_main = await get_data(pair, current_tf, 200)
-                        df_htf = await get_data(pair, htf, 100)
+Pair: {symbol}
+Bias 15m: {bias}
 
-                        if df_main.empty or df_htf.empty:
-                            continue
+✔ Liquidity Sweep (5m)
+✔ Anchored VWAP
+✔ Fibonacci Zone
+✔ Volume Confirmed
 
-                        signal, price = await check_signal(df_main, df_htf)
+Entry: {price:.4f}
+SL: {sl:.4f}
+TP1: {tp1:.4f}
+TP2: {tp2:.4f}
 
-                        if signal:
-                            tp = price * (1 + TP_PERCENT) if signal == "BUY" else price * (1 - TP_PERCENT)
-                            sl = price * (1 - SL_PERCENT) if signal == "BUY" else price * (1 + SL_PERCENT)
+Capital: {CAPITAL} USDT
+Risk: {RISK_PERCENT*100:.2f}%
+"""
+        send_telegram(msg)
 
-                            # ─── FIXED: single f-string ────────────────────────────────
-                            msg = (
-                                f"📊 **{pair}** ({current_tf})\n"
-                                f"Signal: **{signal}**\n"
-                                f"Prix: `{price:.4f}`\n"
-                                f"TP: `{tp:.4f}`\n"
-                                f"SL: `{sl:.4f}`"
-                            )
-                            # ───────────────────────────────────────────────────────────
-                            
-                            # Envoyer le message
-                            if app.bot_data.get('chat_id'):
-                                await app.bot.send_message(
-                                    chat_id=app.bot_data['chat_id'],
-                                    text=msg,
-                                    parse_mode="Markdown"
-                                )
+    except:
+        pass
 
-                        await asyncio.sleep(1)
+# ================= LOOP =================
+send_telegram("✅ Scalping bot ALL PAIRS started (Railway)")
 
-                    except Exception as e:
-                        logger.error(f"Erreur {pair}: {e}")
-            
-            # Attendre 60 secondes avant le prochain scan complet
-            for _ in range(60):
-                if not watching:
-                    break
-                await asyncio.sleep(1)
-                
-        except Exception as e:
-            logger.error(f"Erreur dans boucle principale: {e}")
-            await asyncio.sleep(10)
-
-# ===== HANDLERS =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("🚀 Start 5m", callback_data="start_5m")],
-        [InlineKeyboardButton("⚡ Start 15m", callback_data="start_15m")],
-        [InlineKeyboardButton("🛑 Stop", callback_data="stop")],
-        [InlineKeyboardButton("📋 Liste", callback_data="list")],
-        [InlineKeyboardButton("❓ Aide", callback_data="help")],
-    ]
-    await update.message.reply_text(
-        "🤖 **Bot de Signaux**\nChoisissez une option:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global watching, current_tf
-    
-    query = update.callback_query
-    await query.answer()
-
-    # Sauvegarder le chat_id
-    context.bot_data['chat_id'] = query.message.chat_id
-
-    if query.data == "start_5m":
-        watching = True
-        current_tf = "5m"
-        await query.edit_message_text("✅ Surveillance **5m** activée!\nLes signaux apparaîtront ici.")
-        logger.info("Surveillance 5m activée")
-
-    elif query.data == "start_15m":
-        watching = True
-        current_tf = "15m"
-        await query.edit_message_text("✅ Surveillance **15m** activée!\nLes signaux apparaîtront ici.")
-        logger.info("Surveillance 15m activée")
-
-    elif query.data == "stop":
-        watching = False
-        await query.edit_message_text("🛑 Surveillance arrêtée")
-        logger.info("Surveillance arrêtée")
-
-    elif query.data == "list":
-        pairs_text = "\n".join(f"• {p}" for p in PAIRS[:10])
-        await query.edit_message_text(f"**Paires** (10/{len(PAIRS)}):\n{pairs_text}")
-
-    elif query.data == "help":
-        await query.edit_message_text(
-            "**Aide**\n"
-            "• Start: Active la surveillance\n"
-            "• Stop: Désactive\n"
-            "• Signaux basés sur EMA/RSI/Volume\n"
-            "• Scan toutes les 60 secondes"
-        )
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global watching, current_tf
-    await update.message.reply_text(
-        f"📊 **Statut**\n"
-        f"Actif: {'✅ Oui' if watching else '❌ Non'}\n"
-        f"Timeframe: {current_tf}\n"
-        f"Paires: {len(PAIRS)}"
-    )
-
-# ===== MAIN =====
-async def main():
-    global scan_task
-    
-    logger.info("🚀 Démarrage du bot...")
-
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(CommandHandler("status", status))
-
-    app.bot_data['chat_id'] = None
-
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-
-    logger.info("✅ Bot démarré!")
-
-    asyncio.create_task(scanning_loop(app))
-
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Arrêt...")
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+while True:
+    for sym in SYMBOLS:
+        analyze(sym)
+        time.sleep(1.2)  # anti rate-limit
