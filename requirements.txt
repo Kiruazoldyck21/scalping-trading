@@ -1,5 +1,4 @@
-pandas
-requests
 ccxt
-ta
-python-telegram-bot==21.5
+pandas
+numpy
+requests 
