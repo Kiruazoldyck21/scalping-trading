@@ -5,33 +5,43 @@ import time
 import os
 import traceback
 
-# ================= CONFIG =================
+# ────────────────────────────────────────────────
+#               CONFIGURATION
+# ────────────────────────────────────────────────
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-CAPITAL = 1000
-RISK_PERCENT = 0.8
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    print("ERROR: Telegram BOT_TOKEN and CHAT_ID must be set in environment variables")
+    exit(1)
+
+CAPITAL      = 1000.0       # USDT
+RISK_PERCENT = 0.8          # % of capital to risk per trade
 
 TIMEFRAMES = {
-    "bias": "15m",
+    "bias":  "15m",
     "setup": "5m",
     "entry": "1m"
 }
 
-# Much longer sleep → prevent ban (start conservative!)
-SLEEP_BETWEEN_PAIRS = 12          # seconds — 5 pairs/min → \~safe
+SLEEP_BETWEEN_PAIRS = 10.0      # seconds — be very conservative on Railway
+MAX_PAIRS_TO_SCAN   = 50        # start small, increase later if stable
 
-# ================= EXCHANGE =================
+# ────────────────────────────────────────────────
+#               EXCHANGE SETUP
+# ────────────────────────────────────────────────
+
 exchange = ccxt.binance({
-    "enableRateLimit": True,
-    "options": {"defaultType": "spot"}
+    'enableRateLimit': True,
+    'options': {'defaultType': 'spot'}
 })
 
-# ================= TELEGRAM =================
-def send_telegram(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram not configured")
-        return
+# ────────────────────────────────────────────────
+#               TELEGRAM SENDER
+# ────────────────────────────────────────────────
+
+def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -39,147 +49,188 @@ def send_telegram(message):
         "parse_mode": "Markdown"
     }
     try:
-        r = requests.post(url, data=payload, timeout=12)
-        if r.status_code != 200:
-            print(f"Telegram failed: {r.text}")
+        resp = requests.post(url, data=payload, timeout=10)
+        if resp.status_code != 200:
+            print(f"Telegram send failed ({resp.status_code}): {resp.text}")
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Telegram exception: {e}")
 
-# ================= MARKETS =================
-def load_usdt_pairs(max_pairs=60):   # ← limit to avoid death by API calls
-    markets = exchange.load_markets()
-    pairs = []
-    for symbol in markets:
-        if (
-            symbol.endswith("/USDT")
-            and markets[symbol].get("active")
-            and "BUSD" not in symbol
-            and "USDC" not in symbol
-        ):
-            pairs.append(symbol)
-    # Optional: sort by volume (requires extra call — or hardcode top ones)
-    return pairs[:max_pairs]   # start small — increase later if stable
+# ────────────────────────────────────────────────
+#               PAIR LOADING
+# ────────────────────────────────────────────────
 
-SYMBOLS = load_usdt_pairs()
-
-# ================= DATA =================
-def fetch_df(symbol, timeframe, limit=300):
+def get_usdt_pairs(max_pairs: int = MAX_PAIRS_TO_SCAN) -> list[str]:
     try:
-        data = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        df = pd.DataFrame(data, columns=["t", "o", "h", "l", "c", "v"])
-        df["t"] = pd.to_datetime(df["t"], unit="ms")
+        markets = exchange.load_markets()
+        pairs = [
+            sym for sym in markets
+            if sym.endswith("/USDT")
+            and markets[sym].get('active', False)
+            and "BUSD" not in sym
+            and "USDC" not in sym
+        ]
+        # You can sort by quoteVolume later if desired
+        return pairs[:max_pairs]
+    except Exception as e:
+        print(f"Failed to load markets: {e}")
+        return []
+
+SYMBOLS = get_usdt_pairs()
+
+# ────────────────────────────────────────────────
+#               DATA FETCH
+# ────────────────────────────────────────────────
+
+def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame | None:
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
     except Exception as e:
-        print(f"fetch failed {symbol} {timeframe}: {e}")
+        print(f"fetch_ohlcv failed {symbol} {timeframe}: {e}")
         return None
 
-# ================= INDICATORS =================
-def liquidity_sweep(df):
-    if df is None or len(df) < 5:
+# ────────────────────────────────────────────────
+#               INDICATORS
+# ────────────────────────────────────────────────
+
+def detect_liquidity_sweep(df: pd.DataFrame) -> str | None:
+    if df is None or len(df) < 8:
         return None
-    recent_high = df['h'].iloc[-6:-1].max()   # lookback improved
-    recent_low  = df['l'].iloc[-6:-1].min()
-    last = df.iloc[-1]
-    if last['h'] > recent_high and last['c'] < recent_high * 0.999:
+
+    lookback = 7
+    recent_high = df['high'].iloc[-lookback-1:-1].max()
+    recent_low  = df['low'].iloc[-lookback-1:-1].min()
+
+    candle = df.iloc[-1]
+
+    # Wick above recent high + close below it → swept buy-side liquidity
+    if candle['high'] > recent_high and candle['close'] < recent_high:
         return "SELL"
-    if last['l'] < recent_low and last['c'] > recent_low * 1.001:
+
+    # Wick below recent low + close above it → swept sell-side liquidity
+    if candle['low'] < recent_low and candle['close'] > recent_low:
         return "BUY"
+
     return None
 
-def fibonacci_zone(high, low, price):
+
+def in_fib_zone(high: float, low: float, price: float) -> bool:
     if high <= low:
         return False
-    for f in [0.618, 0.705, 0.786]:
-        level = high - (high - low) * f
-        if abs(price - level) / price < 0.005:   # widened to 0.5%
+    rng = high - low
+    for ratio in [0.618, 0.705, 0.786]:
+        level = high - rng * ratio
+        if abs(price - level) <= rng * 0.012:          # \~1.2% of range — quite forgiving
             return True
     return False
 
-def volume_ok(df):
+
+def has_good_volume(df: pd.DataFrame) -> bool:
     if df is None or len(df) < 25:
         return False
-    avg = df["v"].rolling(20).mean().iloc[-1]
-    return df["v"].iloc[-1] > avg * 1.3   # stricter
+    avg_vol = df['volume'].rolling(20).mean().iloc[-1]
+    return df['volume'].iloc[-1] > avg_vol * 1.35
 
-# ================= CORE =================
-def analyze(symbol):
+
+# ────────────────────────────────────────────────
+#               MAIN ANALYSIS
+# ────────────────────────────────────────────────
+
+def scan_symbol(symbol: str):
     try:
-        df15 = fetch_df(symbol, TIMEFRAMES["bias"])
-        if df15 is None: return
+        df15 = fetch_ohlcv(symbol, TIMEFRAMES["bias"])
+        df5  = fetch_ohlcv(symbol, TIMEFRAMES["setup"])
+        df1  = fetch_ohlcv(symbol, TIMEFRAMES["entry"], limit=120)
 
-        df5 = fetch_df(symbol, TIMEFRAMES["setup"])
-        if df5 is None: return
-
-        df1 = fetch_df(symbol, TIMEFRAMES["entry"], limit=150)
-        if df1 is None: return
-
-        sweep = liquidity_sweep(df5)
-        if sweep is None:
+        if any(df is None for df in (df15, df5, df1)):
             return
 
-        bias = "BULLISH" if df15["c"].iloc[-1] > df15["o"].iloc[-1] else "BEARISH"
-        price = float(df1["c"].iloc[-1])
-
-        if not volume_ok(df1):
+        direction = detect_liquidity_sweep(df5)
+        if not direction:
             return
 
-        high = df5["h"].max()
-        low = df5["l"].min()
+        price = float(df1['close'].iloc[-1])
 
-        if not fibonacci_zone(high, low, price):
+        if not has_good_volume(df1):
             return
 
-        if sweep == "SELL":
-            sl = price * 1.004
-            tp1 = price - (sl - price) * 1.5
-            tp2 = price - (sl - price) * 2.5
-        else:
-            sl = price * 0.996
-            tp1 = price + (price - sl) * 1.5
-            tp2 = price + (price - sl) * 2.5
+        range_high = df5['high'].max()
+        range_low  = df5['low'].min()
 
-        msg = f"""**SCALPING ALERT**
+        if not in_fib_zone(range_high, range_low, price):
+            return
 
-**PAIR:** {symbol}
-**BIAS 15M:** {bias}
-**DIRECTION:** {sweep}
+        # ─── Risk & Targets ────────────────────────────────
+        if direction == "SELL":
+            sl   = price * 1.0045
+            risk = sl - price
+            tp1  = price - risk * 1.6
+            tp2  = price - risk * 3.0
+        else:  # BUY
+            sl   = price * 0.9955
+            risk = price - sl
+            tp1  = price + risk * 1.6
+            tp2  = price + risk * 3.0
 
-**ENTRY:** {price:.6f}
-**SL:**     {sl:.6f}
-**TP1:**    {tp1:.6f}
-**TP2:**    {tp2:.6f}
+        # Position size
+        risk_usdt = CAPITAL * (RISK_PERCENT / 100)
+        qty_approx = risk_usdt / risk if risk > 0 else 0
 
-**CAPITAL:** {CAPITAL} USDT
-**RISK:**    {RISK_PERCENT}%"""
+        emoji = "🟢" if direction == "BUY" else "🔴"
+        title = "BUY" if direction == "BUY" else "SELL"
 
-        send_telegram(msg)
-        print(f"Alert sent → {symbol} {sweep}")
+        bias_15m = "BULLISH" if df15['close'].iloc[-1] > df15['open'].iloc[-1] else "BEARISH"
+
+        message = f"""**{emoji} {title} SIGNAL**  
+**{symbol}**
+
+**15m Bias** • {bias_15m}  
+**Direction** • {direction}
+
+**Entry** • `{price:.6f}`  
+**Stop**  • `{sl:.6f}`  
+**TP1**   • `{tp1:.6f}`  
+**TP2**   • `{tp2:.6f}`
+
+**Risk** • {risk_usdt:.2f} USDT  ({RISK_PERCENT}%)  
+**Size** ≈ **{qty_approx:.2f}** {symbol.split('/')[0]}
+
+_(scalp — 1m entry filter — fib confluence — volume spike)_
+"""
+
+        send_telegram(message)
+        print(f"→ Alert sent: {symbol} {direction}")
 
     except Exception as e:
-        err = traceback.format_exc()
-        print(f"ERROR {symbol}: {e}\n{err}")
-        send_telegram(f"ERROR on {symbol}: {str(e)[:200]}")
+        print(f"Error scanning {symbol}: {e}")
+        # traceback.print_exc()   # uncomment during debug
 
-# ================= START =================
+
+# ────────────────────────────────────────────────
+#               MAIN LOOP
+# ────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    print(f"BOT STARTED - Binance Spot - {len(SYMBOLS)} pairs")
-    send_telegram(f"Bot started on Railway — scanning {len(SYMBOLS)} pairs")
+    print(f"Bot started • {len(SYMBOLS)} pairs • Railway mode")
+    send_telegram(f"Bot **started** on Railway\nScanning **{len(SYMBOLS)}** USDT pairs")
 
     while True:
         try:
-            for s in SYMBOLS:
-                analyze(s)
+            for symbol in SYMBOLS:
+                scan_symbol(symbol)
                 time.sleep(SLEEP_BETWEEN_PAIRS)
-            
-            # Optional: reload symbols every 4 hours (new listings)
-            time.sleep(60 * 60 * 4)
-            global SYMBOLS
-            SYMBOLS = load_usdt_pairs()
-            print(f"Reloaded symbols — now {len(SYMBOLS)} pairs")
+
+            # Reload pair list every \~6 hours
+            time.sleep(60 * 60 * 6)
+            SYMBOLS = get_usdt_pairs()
+            print(f"Symbols refreshed → now {len(SYMBOLS)} pairs")
 
         except KeyboardInterrupt:
-            print("Stopped by user")
+            print("Stopped manually")
             break
         except Exception as e:
-            print(f"Main loop crash: {e}")
-            time.sleep(300)   # wait 5 min before retry
+            print(f"Main loop error: {e}")
+            send_telegram(f"⚠️ Bot crashed: {str(e)[:180]}")
+            time.sleep(300)  # 5 min cooldown
