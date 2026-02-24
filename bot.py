@@ -146,10 +146,10 @@ class PairManager:
         self.exchange_manager = exchange_manager
         self.pairs = []
         
-    def get_usdt_pairs(self, max_pairs: int = MAX_PAIRS_TO_SCAN) -> List[str]:
+    def get_usdt_pairs(self, max_pairs: int = MAX_PAIRS_TO_SCAN, force_refresh: bool = False) -> List[str]:
         """Get active USDT trading pairs"""
         try:
-            markets = self.exchange_manager.get_markets()
+            markets = self.exchange_manager.get_markets(force_refresh=force_refresh)
             pairs = [
                 symbol for symbol in markets
                 if symbol.endswith("/USDT")
@@ -380,6 +380,7 @@ class TradingBot:
         self.formatter = MessageFormatter()
         self.scan_count = 0
         self.signal_count = 0
+        self._start_time = time.time()
         
     def run(self):
         """Main bot loop"""
@@ -481,9 +482,6 @@ _Running on Railway_"""
     
     def get_uptime(self) -> str:
         """Calculate bot uptime"""
-        if not hasattr(self, '_start_time'):
-            self._start_time = time.time()
-        
         uptime = time.time() - self._start_time
         hours = int(uptime // 3600)
         minutes = int((uptime % 3600) // 60)
@@ -512,11 +510,18 @@ def health_check():
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
             self.wfile.write(b'Bot is running')
+        
+        def log_message(self, format, *args):
+            # Suppress default logging
+            pass
     
     def run_health_server():
-        with socketserver.TCPServer(("", PORT), Handler) as httpd:
-            logger.info(f"Health check server running on port {PORT}")
-            httpd.serve_forever()
+        try:
+            with socketserver.TCPServer(("", PORT), Handler) as httpd:
+                logger.info(f"Health check server running on port {PORT}")
+                httpd.serve_forever()
+        except Exception as e:
+            logger.error(f"Health check server error: {e}")
     
     # Start health check server in background thread
     health_thread = Thread(target=run_health_server, daemon=True)
