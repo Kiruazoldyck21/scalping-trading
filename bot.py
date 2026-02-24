@@ -58,7 +58,23 @@ def send_telegram(message: str):
 # ────────────────────────────────────────────────
 #               PAIR LOADING
 # ────────────────────────────────────────────────
+# Replace your current msg = ... block with this
+direction_str = "BUY" if direction == "BUY" else "SELL"
+emoji = "🟢" if direction == "BUY" else "🔴"
 
+message = (
+    "**" + emoji + " " + direction_str + " SIGNAL**  \n"
+    "**" + symbol + "**\n\n"
+    "**15m Bias** • " + bias_15m + "  \n"
+    "**Direction** • " + direction + "\n\n"
+    "**Entry** • `" + "{:.6f}".format(price) + "`  \n"
+    "**Stop**  • `" + "{:.6f}".format(sl) + "`  \n"
+    "**TP1**   • `" + "{:.6f}".format(tp1) + "`  \n"
+    "**TP2**   • `" + "{:.6f}".format(tp2) + "`\n\n"
+    "**Risk** • {:.2f} USDT  ({}%)  \n".format(risk_usdt, RISK_PERCENT) +
+    "**Size** ≈ **{:.2f}** {}\n\n".format(qty_approx, symbol.split('/')[0]) +
+    "_(scalp — 1m entry — fib — volume spike)_"
+)
 def get_usdt_pairs(max_pairs: int = MAX_PAIRS_TO_SCAN) -> list[str]:
     try:
         markets = exchange.load_markets()
